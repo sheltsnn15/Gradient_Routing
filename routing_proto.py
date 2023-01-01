@@ -1,130 +1,136 @@
-import wsnsimpy.wsnsimpy as wsp
+# Shelton Ngwenya, R00203947
+
+import random as random
+
+import wsnsimpy.wsnsimpy as wsp_nongui
+import wsnsimpy.wsnsimpy_tk as wsp
 
 from node_messages import NodeMessages
 
 INFINITY = float('inf')
-TRICKLE_MIN_PERIOD = 0.1
-TRICKLE_MAX_PERIOD = 2.0
 
 
-class RoutingProtocol:
-    def __init__(self, node):
-        # Store a reference to the node that this routing protocol instance is associated with
+class GradientRouting:
+
+    def __init__(self, sim, node):
+        # node instance this routing layer belongs to
         self.node = node
-        # Initialize variables for keeping track of the preferred parent, potential parents, and the
-        # best distance and rank of the node
-        self.best_distance = INFINITY
-        self.rank = INFINITY
-        self.preferred_parent = None
-        self.potential_parents = {}
-        # Create a timer for sending gradient updates using the TRICKLE algorithm
-        self.trickle_timer = node.timeout(TRICKLE_MIN_PERIOD, self.send_gradient_update)
-        # Store a reference to the physical layer of the node
-        self.phy = node.phy
-        # Set a flag for logging
+        # physical layer instance used to send and receive packets
+        self.phy = wsp.DefaultPhyLayer(node)
+        # simulation instance
+        self.sim = sim
+
+    def init(self):
+        # enable logging for this node
         self.logging = True
 
-    def run(self):
-        # Continuously send gradient updates according to the TRICKLE algorithm
-        while True:
-            yield self.trickle_timer.interval
-            self.trickle_timer.reset()
-            self.send_gradient_update()
+    def check_trickle_parent(self):
+        # Check if the preferred parent is in the potential parents dictionary
+        if self.node.preferred_parent in self.node.potential_parents:
+            # Get the last update time for the preferred parent
+            _, _, last_update_time = self.node.potential_parents[self.node.preferred_parent]
+            # If the time since the last update exceeds the maximum Trickle period, send a gradient update
+            if self.node.sim.now - last_update_time > 2 * self.node.trickle_timer_max:
+                self.send_gradient
 
-    def send_gradient_update(self):
-        # Don't send a gradient update if the rank of the node is infinity
-        if self.rank == INFINITY:
-            return
-
-        # Increase the interval between gradient updates according to the TRICKLE algorithm
-        if self.trickle_timer.interval < TRICKLE_MAX_PERIOD:
-            self.trickle_timer.interval *= 2
-
-        # Create a PDU containing the gradient update message and send it to all nodes in the network
-        pdu = wsp.PDU(
+    def send_gradient(self):
+        # create gradient packet to be broadcasted
+        pdu = wsp_nongui.PDU(
             None,
             len(NodeMessages.TYPE_GRADIENT) * 8,
             type=NodeMessages.TYPE_GRADIENT,
-            sender=self.node.id,
-            rank=self.rank,
-            best_distance=self.best_distance
-        )
-        self.node.send(wsp.BROADCAST_ADDR, pdu)
+            src=self.node.id,
+            best_dist=self.node.best_distance,
+            rank=self.node.rank,
+            dest=wsp.BROADCAST_ADDR)
 
-    def update_parent(self, parent_id):
-        # Update the preferred parent and the best distance and rank of the node based on the
-        # information in the PDU
-        if parent_id in self.potential_parents:
-            self.preferred_parent = self.node.sim.get_node(parent_id)
-            self.best_distance = self.preferred_parent.routing_protocol.best_distance + 1
-            self.rank = self.best_distance
-            # Reset the trickle timer to the minimum interval
-            self.trickle_timer.interval = TRICKLE_MIN_PERIOD
-            self.trickle_timer.reset()
+        # double trickle timer period if it has not reached the maximum period
+        if self.node.trickle_timer_period < self.node.trickle_timer_max:
+            self.node.trickle_timer_period = 2 * self.node.trickle_timer_period
 
-    def remove_parent(self, parent_id):
-        # Remove the specified parent from the potential parents list and update the preferred parent
-        # and the best distance and rank of the node accordingly
-        if parent_id in self.potential_parents:
-            del self.potential_parents[parent_id]
-            self.preferred_parent = None
-            self.best_distance = INFINITY
-            self.rank = INFINITY
-            for _, parent in self.potential_parents.items():
-                if parent["best_distance"] < self.best_distance:
-                    self.preferred_parent = self.node.sim.get_node(parent["id"])
-                    self.best_distance = parent["best_distance"]
-                    self.rank = self.best_distance
-            # If there are no more potential parents, set the trickle timer interval to the maximum value
-            if not self.preferred_parent:
-                self.trickle_timer.interval = TRICKLE_MAX_PERIOD
-            # Otherwise, set the trickle timer interval to the minimum value and reset the timer
-            else:
-                self.trickle_timer.interval = TRICKLE_MIN_PERIOD
-                self.trickle_timer.reset()
+        # send gradient packet if trickle timer has reached the maximum period or has just been doubled
+        if self.node.trickle_timer_period == self.node.trickle_timer_max or self.node.trickle_timer_period == 2 * self.node.trickle_timer_period:
+            self.phy.send_pdu(pdu)
 
     def send_pdu(self, pdu):
-        # Check if the node has a preferred parent
-        if self.preferred_parent is None:
-            return False
-        # Set the type of the PDU to "data" and the sender ID to the ID of the node
-        pdu.type = "data"
-        pdu.sender_id = self.node.id
-
-        # Create a new PDU containing the data message and send it to the preferred parent
-        pdu = wsp.PDU(
-            None,
-            len(NodeMessages.TYPE_DATA) * 8,
-            type=NodeMessages.TYPE_DATA,
-            sender=self.node.id,
-            rank=pdu.rank,
-            best_distance=pdu.best_distance
-        )
-        self.phy.send(self.preferred_parent, pdu)
-        return True
+        # send packet through the physical layer if a preferred parent has been set
+        if self.node.preferred_parent is not None:
+            pdu.dest = self.node.preferred_parent
+            self.phy.send_pdu(pdu)
+            return True
+        return False
 
     def on_receive_pdu(self, pdu):
-        # Handle a received PDU depending on its type
-        if pdu.type == "gradient":
-            # Update the preferred parent, best distance, and rank of the node based on the information
-            # in the PDU
-            if pdu.rank < self.rank:
-                self.update_parent(pdu.sender_id)
-            elif pdu.rank == self.rank:
-                if pdu.best_distance < self.best_distance:
-                    self.update_parent(pdu.sender_id)
-                elif pdu.best_distance == self.best_distance:
-                    if pdu.sender_id < self.node.id:
-                        self.update_parent(pdu.sender_id)
-            # Add the sender of the PDU to the list of potential parents
-            self.potential_parents[pdu.sender_id] = {
-                "id": pdu.sender_id,
-                "rank": pdu.rank,
-                "best_distance": pdu.best_distance,
-            }
-        elif pdu.type == "data":
-            # Forward the data message to the preferred parent if the node has one, otherwise drop the message
-            if self.node.id == 0:
+        # Update the node's state based on the received PDU
+        self.update(pdu)
+
+    def run(self):
+        # Schedule the first gradient update with a random delay
+        self.node.sim.delayed_exec(random.random() * 0.1, self.send_gradient)
+
+    def update(self, pdu):
+        # update routing state based on received gradient packet
+        if pdu.type == NodeMessages.TYPE_GRADIENT:
+            # if the sender of the gradient packet is the preferred parent of the node, schedule a check for trickle
+            # timer expiration
+            if pdu.src == self.node.preferred_parent:
+                self.node.sim.delayed_exec(random.random() * 0.1, self.check_trickle_parent)
+
+            # if the node is not the sink and the sender's rank is not infinity, update the list of potential parents
+            # and the preferred parent
+            if self.node.id != 0 and pdu.rank != INFINITY:
+                self.update_potential_parents(pdu)
+                self.update_preferred_parent(pdu)
+
+        # if the received packet is a data packet
+        elif pdu.type == NodeMessages.TYPE_DATA:
+            # if the packet is intended for this node, pass it to the application layer
+            if pdu.dst == self.node.id:
                 self.node.on_receive_pdu(pdu)
+            # otherwise, forward the packet to the preferred parent
             else:
                 self.send_pdu(pdu)
+
+    def print_node_status(self, status):
+        self.node.log(f'{status}')
+
+    def update_potential_parents(self, pdu):
+        # update the list of potential parents with the new information from the received gradient packet
+        self.node.potential_parents[pdu.src] = [round(pdu.rank), round(pdu.best_dist), round(self.node.sim.now, 2)]
+        self.print_node_status(f'Potential parents: {self.node.potential_parents.items()}')
+
+    def update_preferred_parent(self, pdu):
+        # if the node is not the sink and the sender's rank is not infinity, update the preferred parent
+        if self.node.id != 0 and pdu.rank != INFINITY:
+            self.update_potential_parents(pdu)
+            # if the node has no preferred parent or the sender's rank is lower than the node's rank,
+            # set the sender as the preferred parent
+            if self.node.preferred_parent is None or pdu.rank + 1 < self.node.rank:
+                self.set_new_parent(pdu)
+
+            # if the sender's rank is equal to the node's rank, compare the best distances
+            elif pdu.rank + 1 == self.node.rank:
+                if pdu.best_dist + 1 < self.node.best_distance:
+                    self.set_new_parent(pdu)
+
+            # if the sender's rank is equal to the node's rank, compare the best distances
+            elif pdu.rank == self.node.rank:
+                if pdu.best_dist < self.node.best_distance:
+                    self.set_new_parent(pdu)
+
+    def update_parent(self, old_parent, new_parent):
+        # delete the link to the old preferred parent
+        if old_parent is not None:
+            self.node.scene.dellink(old_parent, self.node.id, "myline")
+
+        # add a link to the new preferred parent
+        self.node.scene.addlink(new_parent, self.node.id, "myline")
+
+    def set_new_parent(self, pdu):
+        self.node.rank = pdu.rank + 1
+        self.print_node_status(f'STATUS UPDATE: New rank ({self.node.rank}), New parent\'s rank ({pdu.rank})')
+        self.node.best_distance = pdu.best_dist + 1
+        self.node.potential_parents = {}
+        old_parent = self.node.preferred_parent
+        self.node.preferred_parent = pdu.src
+        self.update_parent(old_parent, self.node.preferred_parent)
